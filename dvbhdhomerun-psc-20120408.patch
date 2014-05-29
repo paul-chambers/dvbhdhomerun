@@ -1,0 +1,111 @@
+diff -u -r dvbhdhomerun.orig/kernel/do.sh dvbhdhomerun/kernel/do.sh
+--- dvbhdhomerun.orig/kernel/do.sh	2010-09-10 08:17:28.000000000 -0700
++++ dvbhdhomerun/kernel/do.sh	2012-03-04 21:11:19.145407576 -0800
+@@ -10,12 +10,10 @@
+ if [ "$?" != "0" ]; then
+     exit -1;
+ fi
+-echo 
+ echo
+-sudo rmmod dvb_hdhomerun
+-sudo rmmod dvb_hdhomerun_fe
+-sudo rmmod dvb_hdhomerun_core
+-echo 
++sudo rmmod -v dvb_hdhomerun
++sudo rmmod -v dvb_hdhomerun_fe
++sudo rmmod -v dvb_hdhomerun_core
+ echo
+-sudo modprobe dvb_hdhomerun
++sudo modprobe -v dvb_hdhomerun
+ 
+diff -u -r dvbhdhomerun.orig/kernel/dvb_hdhomerun_init.c dvbhdhomerun/kernel/dvb_hdhomerun_init.c
+--- dvbhdhomerun.orig/kernel/dvb_hdhomerun_init.c	2010-12-09 04:06:35.000000000 -0800
++++ dvbhdhomerun/kernel/dvb_hdhomerun_init.c	2012-04-01 12:41:14.015963864 -0700
+@@ -210,6 +210,9 @@
+ 	if (ret < 0)
+ 		goto err_disconnect_frontend;
+ 
++	strncpy( hdhomerun->fe->ops.info.name, hdhomerun->tuner_data.name, sizeof(hdhomerun->fe->ops.info.name) );
++	hdhomerun->fe->ops.info.name[ sizeof(hdhomerun->fe->ops.info.name) - 1 ] = '\0';
++
+ 	ret = dvb_register_frontend(dvb_adapter, hdhomerun->fe);
+ 	if (ret < 0)
+ 		goto err_release_frontend;
+diff -u -r dvbhdhomerun.orig/userhdhomerun/hdhomerun_control.cpp dvbhdhomerun/userhdhomerun/hdhomerun_control.cpp
+--- dvbhdhomerun.orig/userhdhomerun/hdhomerun_control.cpp	2011-11-23 11:58:14.000000000 -0800
++++ dvbhdhomerun/userhdhomerun/hdhomerun_control.cpp	2012-04-01 12:55:28.250112542 -0700
+@@ -118,8 +118,8 @@
+ 
+   struct hdhomerun_register_tuner_data tuner_data;
+   tuner_data.num_of_devices = _numOfTuners;
+-  strncpy(tuner_data.name, _name.c_str(), 11);
+-  tuner_data.name[10] = 0;
++  strncpy(tuner_data.name, _name.c_str(), sizeof(tuner_data.name) );
++  tuner_data.name[ sizeof(tuner_data.name) - 1 ] = '\0';
+   tuner_data.type = _type;
+   int ret = ioctl(m_fdIoctl, HDHOMERUN_REGISTER_TUNER, &tuner_data);
+   if(ret != 0) {
+diff -u -r dvbhdhomerun.orig/userhdhomerun/hdhomerun_controller.cpp dvbhdhomerun/userhdhomerun/hdhomerun_controller.cpp
+--- dvbhdhomerun.orig/userhdhomerun/hdhomerun_controller.cpp	2011-03-06 11:51:35.000000000 -0800
++++ dvbhdhomerun/userhdhomerun/hdhomerun_controller.cpp	2012-04-01 12:29:14.547928020 -0700
+@@ -37,6 +37,12 @@
+   // Discover HDHomeRun's 
+   //
+   struct hdhomerun_discover_device_t devices[m_maxDevices];
++  
++  // 'devices' is alloc'd on stack, so zero it as a precaution.
++  // hdhomerun_discover_device_t has grown in size across versions of libhdhomerun
++  // and I don't see a way to programmatically check libhdhomerun's API version.
++  // ...really fragile API design...
++  memset(devices, 0, sizeof(devices));
+ 
+   int numOfDevices = hdhomerun_discover_find_devices_custom(0, HDHOMERUN_DEVICE_TYPE_TUNER, HDHOMERUN_DEVICE_ID_WILDCARD, devices, m_maxDevices);
+   LOG() << "Num of devices = " << numOfDevices << endl;
+@@ -49,12 +55,20 @@
+   //
+   // Create an object for each tuner to handle data streaming/filtering/etc.
+   //
+-  const int MAX_TUNERS = 2; 
+-  for(int i = 0; i < numOfDevices; ++i) {
+-    for(int j = 0; j < MAX_TUNERS; ++j) {
+-      HdhomerunTuner* tuner = new HdhomerunTuner(devices[i].device_id, devices[i].ip_addr, j);
+-      m_tuners.push_back(tuner);
+-    }
++  for (int i = 0; i < numOfDevices; ++i) {
++    // sanity check, just in case there's an older version of libhdhomerun installed
++    if (hdhomerun_discover_validate_device_id(devices[i].device_id) && devices[i].tuner_count <= 10) {
++      LOG() << endl << "Device " << hex << devices[i].device_id
++	    << " is type " << devices[i].device_type
++	    << " and has " << (unsigned int)devices[i].tuner_count << " tuners" << endl;
++      for (int j = 0; j < devices[i].tuner_count; ++j) {
++	HdhomerunTuner* tuner = new HdhomerunTuner(devices[i].device_id, devices[i].ip_addr, j);
++	m_tuners.push_back(tuner);
++      }
++    } else {
++      ERR() << "Device " << hex << devices[i].device_id << " reports invalid information" << endl;
++      _exit(-1);
++    } 
+   }
+ 
+   LOG() << endl;
+@@ -68,7 +82,7 @@
+   for(it = m_tuners.begin(); it != m_tuners.end(); ++it) {
+     int kernelId = 0;
+ 
+-    if(m_control->Ioctl(numOfDevices * MAX_TUNERS, (*it)->GetName(), kernelId, (*it)->GetType())) {
++    if(m_control->Ioctl(m_tuners.size(), (*it)->GetName(), kernelId, (*it)->GetType())) {
+       ostringstream stream;
+       stream << "/dev/hdhomerun_data" << kernelId;
+       (*it)->SetDataDeviceName(stream.str());
+diff -u -r dvbhdhomerun.orig/userhdhomerun/hdhomerun_tuner.h dvbhdhomerun/userhdhomerun/hdhomerun_tuner.h
+--- dvbhdhomerun.orig/userhdhomerun/hdhomerun_tuner.h	2011-03-06 11:51:35.000000000 -0800
++++ dvbhdhomerun/userhdhomerun/hdhomerun_tuner.h	2012-02-18 15:20:25.401923265 -0800
+@@ -24,7 +24,7 @@
+ 
+ #include "thread_pthread.h"
+ 
+-#include <hdhomerun.h>
++#include <hdhomerun/hdhomerun.h>
+ 
+ #include <string>
+ #include <vector>
